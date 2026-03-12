@@ -15,6 +15,7 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+import json
 
 
 # FIT global message numbers
@@ -352,6 +353,59 @@ def kmh_to_mps(v_kmh: float) -> float:
     return v_kmh / 3.6
 
 
+def normalize_segments(segments: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    out: List[Tuple[float, float]] = []
+    for dur_s, kmh in segments:
+        if dur_s <= 0 or kmh < 0:
+            continue
+        out.append((float(dur_s), float(kmh)))
+    return out
+
+
+def lap_target_mps(
+    lap_i: int,
+    elapsed_s: float,
+    speeds_kmh: List[float],
+    per_lap_segments: Optional[List[Optional[List[Tuple[float, float]]]]],
+) -> float:
+    if per_lap_segments is None or lap_i >= len(per_lap_segments):
+        return kmh_to_mps(speeds_kmh[lap_i])
+    segs = per_lap_segments[lap_i]
+    if not segs:
+        return kmh_to_mps(speeds_kmh[lap_i])
+    t = 0.0
+    for dur_s, kmh in segs:
+        t += dur_s
+        if elapsed_s <= t + 1e-9:
+            return kmh_to_mps(kmh)
+    # extend last segment if elapsed exceeds sum
+    return kmh_to_mps(segs[-1][1])
+
+
+def lap_target_distance(
+    lap_i: int,
+    duration_s: float,
+    speeds_kmh: List[float],
+    per_lap_segments: Optional[List[Optional[List[Tuple[float, float]]]]],
+) -> float:
+    if per_lap_segments is None or lap_i >= len(per_lap_segments):
+        return kmh_to_mps(speeds_kmh[lap_i]) * duration_s
+    segs = per_lap_segments[lap_i]
+    if not segs:
+        return kmh_to_mps(speeds_kmh[lap_i]) * duration_s
+    remaining = duration_s
+    dist = 0.0
+    for dur_s, kmh in segs:
+        if remaining <= 0:
+            break
+        use = min(remaining, dur_s)
+        dist += kmh_to_mps(kmh) * use
+        remaining -= use
+    if remaining > 0:
+        dist += kmh_to_mps(segs[-1][1]) * remaining
+    return dist
+
+
 def assign_laps_to_records(records: List[RecordMsg], laps: List[LapMsg]) -> List[Optional[int]]:
     lap_ranges: List[Tuple[int, int, int]] = []
     for i, lap in enumerate(laps):
@@ -419,6 +473,7 @@ def patch_distances(
     laps: List[LapMsg],
     session: Optional[SessionMsg],
     speeds_kmh: List[float],
+    per_lap_segments: Optional[List[Optional[List[Tuple[float, float]]]]],
     blend: float,
     speed_strategy: str = "invalidate",
     trim_idle_start: bool = False,
@@ -431,6 +486,12 @@ def patch_distances(
 ) -> Dict[str, float]:
     if len(laps) != len(speeds_kmh):
         raise ValueError(f"Speed count ({len(speeds_kmh)}) must equal lap count ({len(laps)})")
+    if per_lap_segments is not None and len(per_lap_segments) != len(laps):
+        raise ValueError("Segments count must equal lap count when provided")
+    if per_lap_segments is not None:
+        per_lap_segments = [
+            normalize_segments(segs) if segs is not None else None for segs in per_lap_segments
+        ]
 
     lap_ratios: List[float] = []
     corrected_lap_distances: List[Optional[float]] = []
@@ -441,7 +502,7 @@ def patch_distances(
             corrected_lap_distances.append(lap.total_distance_m)
             continue
 
-        target = kmh_to_mps(speeds_kmh[i]) * lap.total_timer_s
+        target = lap_target_distance(i, lap.total_timer_s, speeds_kmh, per_lap_segments)
         if lap.total_distance_m is None or lap.total_distance_m <= 0:
             ratio = 1.0
             corrected = target
@@ -562,7 +623,6 @@ def patch_distances(
         for lap_i, idxs in enumerate(lap_record_indices_timed):
             if len(idxs) < 3:
                 continue
-            target_mps = kmh_to_mps(speeds_kmh[lap_i])
             lap_start = new_timestamps[idxs[0]]
             lap_end = new_timestamps[idxs[-1]]
             if lap_start is None or lap_end is None or lap_end <= lap_start:
@@ -601,6 +661,7 @@ def patch_distances(
                 from_start = t - lap_start
                 to_end = lap_end - t
                 is_edge = from_start <= lap_edge_stabilize_sec or to_end <= lap_edge_stabilize_sec
+                target_mps = lap_target_mps(lap_i, float(from_start), speeds_kmh, per_lap_segments)
                 if trim_idle_start and lap_i == 0 and from_start <= 15:
                     # After trimming startup idle, keep first seconds steady to
                     # avoid synthetic acceleration spike in Strava.
@@ -658,7 +719,7 @@ def patch_distances(
         dur = effective_lap_durations[lap_i]
         if dur is None or dur <= 0:
             continue
-        target = kmh_to_mps(speeds_kmh[lap_i]) * dur
+        target = lap_target_distance(lap_i, dur, speeds_kmh, per_lap_segments)
         desired = span + blend * (target - span)
         ratio = desired / span
         for idx in idxs:
@@ -952,6 +1013,39 @@ def write_debug_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
             w.writerow(row)
 
 
+def load_segments_json(path: Path) -> List[Optional[List[Tuple[float, float]]]]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "laps" in data:
+        data = data["laps"]
+    if not isinstance(data, list):
+        raise ValueError("segments json must be a list or {'laps': [...]}")
+    out: List[Optional[List[Tuple[float, float]]]] = []
+    for lap in data:
+        if lap is None:
+            out.append(None)
+            continue
+        if not isinstance(lap, list):
+            raise ValueError("each lap entry must be a list of segments or null")
+        segs: List[Tuple[float, float]] = []
+        for seg in lap:
+            if isinstance(seg, list) and len(seg) == 2:
+                dur_s = float(seg[0])
+                kmh = float(seg[1])
+            elif isinstance(seg, dict):
+                if "duration_sec" in seg:
+                    dur_s = float(seg["duration_sec"])
+                elif "duration_min" in seg:
+                    dur_s = float(seg["duration_min"]) * 60.0
+                else:
+                    raise ValueError("segment must have duration_sec or duration_min")
+                kmh = float(seg["speed_kmh"])
+            else:
+                raise ValueError("segment must be [duration_sec, speed_kmh] or object")
+            segs.append((dur_s, kmh))
+        out.append(normalize_segments(segs))
+    return out
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Correct treadmill FIT distances by lap speeds")
     p.add_argument("input_fit", type=Path, help="Input FIT file")
@@ -960,6 +1054,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--speeds-kmh",
         required=True,
         help="Comma-separated treadmill speeds per lap in km/h (example: 9.5,10,10.5)",
+    )
+    p.add_argument(
+        "--segments-json",
+        type=Path,
+        default=None,
+        help="Optional JSON with per-lap segments [[duration_sec, speed_kmh], ...] for each lap",
     )
     p.add_argument(
         "--blend",
@@ -1019,6 +1119,7 @@ def build_parser() -> argparse.ArgumentParser:
 def correct_fit_bytes(
     input_fit: bytes,
     speeds_kmh: List[float],
+    per_lap_segments: Optional[List[Optional[List[Tuple[float, float]]]]] = None,
     blend: float = 1.0,
     speed_strategy: str = "invalidate",
     trim_idle_start: bool = False,
@@ -1031,6 +1132,7 @@ def correct_fit_bytes(
     output, stats, lap_count, _ = correct_fit_bytes_debug(
         input_fit,
         speeds_kmh,
+        per_lap_segments,
         blend,
         speed_strategy,
         trim_idle_start,
@@ -1046,6 +1148,7 @@ def correct_fit_bytes(
 def correct_fit_bytes_debug(
     input_fit: bytes,
     speeds_kmh: List[float],
+    per_lap_segments: Optional[List[Optional[List[Tuple[float, float]]]]] = None,
     blend: float = 1.0,
     speed_strategy: str = "invalidate",
     trim_idle_start: bool = False,
@@ -1077,6 +1180,7 @@ def correct_fit_bytes_debug(
         laps=laps,
         session=session,
         speeds_kmh=speeds_kmh,
+        per_lap_segments=per_lap_segments,
         blend=blend,
         speed_strategy=speed_strategy,
         trim_idle_start=trim_idle_start,
@@ -1105,9 +1209,11 @@ def main() -> int:
         raise ValueError("--blend must be within [0, 1]")
 
     speeds = parse_speeds(args.speeds_kmh)
+    per_lap_segments = load_segments_json(args.segments_json) if args.segments_json else None
     output, stats, lap_count, debug_rows = correct_fit_bytes_debug(
         args.input_fit.read_bytes(),
         speeds,
+        per_lap_segments,
         args.blend,
         args.speed_strategy,
         args.trim_idle_start,

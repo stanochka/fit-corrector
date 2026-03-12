@@ -9,6 +9,40 @@ import streamlit as st
 from treadmill_fit_corrector import correct_fit_bytes_debug, inspect_laps
 
 
+def parse_segments_text(text: str) -> list[tuple[float, float]]:
+    """
+    Parse segments like: "15m@7.8, 1m@6, 14m@7.5"
+    Allowed formats:
+    - 15m@7.8
+    - 90s@6
+    - 15:7.8 (minutes:speed)
+    - 1@6 (minutes:speed)
+    """
+    out: list[tuple[float, float]] = []
+    if not text.strip():
+        return out
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "@" in part:
+            dur_raw, speed_raw = part.split("@", 1)
+        elif ":" in part:
+            dur_raw, speed_raw = part.split(":", 1)
+        else:
+            raise ValueError(f"Invalid segment '{part}'. Use 15m@7.8 or 15:7.8")
+        dur_raw = dur_raw.strip().lower()
+        speed = float(speed_raw.strip())
+        if dur_raw.endswith("m"):
+            dur_s = float(dur_raw[:-1]) * 60.0
+        elif dur_raw.endswith("s"):
+            dur_s = float(dur_raw[:-1])
+        else:
+            # default minutes
+            dur_s = float(dur_raw) * 60.0
+        out.append((dur_s, speed))
+    return out
+
 st.set_page_config(page_title="FIT Treadmill Corrector", page_icon="🏃", layout="centered")
 st.title("FIT Treadmill Corrector")
 st.caption("Коррекция дистанции FIT-файла по скоростям беговой дорожки на отрезках")
@@ -98,7 +132,9 @@ with st.expander("Тонкие настройки Strava", expanded=False):
     )
 
 st.subheader("Скорости по lap (км/ч)")
+st.caption("Опционально: задай сегменты внутри lap, формат 15m@7.8, 1m@6, 14m@7.5")
 speeds = []
+segments_texts = []
 for i, lap in enumerate(laps):
     default_speed = 10.0
     if lap.total_distance_m and lap.total_timer_s and lap.total_timer_s > 0:
@@ -113,19 +149,32 @@ for i, lap in enumerate(laps):
         key=f"speed_{i}",
     )
     speeds.append(float(speed))
+    seg_text = st.text_input(
+        f"Lap {i + 1} сегменты (опц.)",
+        value="",
+        placeholder="15m@7.8, 1m@6, 14m@7.5",
+        key=f"seg_{i}",
+    )
+    segments_texts.append(seg_text)
 
 signature = (
     f"{uploaded.name}|{blend:.2f}|{speed_strategy}|{int(trim_idle_start)}|"
     f"{lap_edge_stabilize_sec}|{lap_edge_blend:.2f}|{lap_uniform_blend:.2f}|{lap_spike_blend:.2f}|"
+    f"{'|'.join(segments_texts)}|"
     f"{','.join(f'{s:.2f}' for s in speeds)}"
 )
 process_clicked = st.button("Скорректировать файл", type="primary")
 
 if process_clicked:
     try:
+        parsed_segments = []
+        for text in segments_texts:
+            segs = parse_segments_text(text)
+            parsed_segments.append(segs if segs else None)
         output_bytes, stats, lap_count, debug_rows = correct_fit_bytes_debug(
             input_bytes,
             speeds,
+            parsed_segments,
             blend,
             speed_strategy=speed_strategy,
             trim_idle_start=bool(trim_idle_start),

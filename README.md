@@ -30,11 +30,22 @@ python3 treadmill_fit_corrector.py input.fit output.fit --speeds-kmh 9.5,10.0,10
 - `--lap-edge-blend 0.75` — сила стабилизации краёв lap
 - `--lap-uniform-blend 0.35` — дополнительное выравнивание внутри lap против «треугольников» в Strava
 - `--lap-spike-blend 0.2` — мягко подавлять точечные пики/провалы внутри lap
+- `--segments-json segments.json` — опциональные подсегменты внутри lap (скорость меняется внутри lap)
 
 Диагностика по `record` (удобно для разбора артефактов в Strava):
 
 ```bash
 python3 treadmill_fit_corrector.py input.fit output.fit --speeds-kmh 9.5,10.0,10.5 --blend 1.0 --speed-strategy invalidate --trim-idle-start --trim-idle-end --lap-edge-stabilize-sec 8 --lap-edge-blend 0.75 --lap-uniform-blend 0.35 --lap-spike-blend 0.2 --debug-csv debug.csv
+```
+
+Пример `segments.json` (durations в секундах):
+
+```json
+[
+  [[900, 7.8], [60, 6.0], [840, 7.5]],
+  null,
+  [[600, 8.2], [300, 7.4]]
+]
 ```
 
 ## Примечания
@@ -55,6 +66,21 @@ streamlit run streamlit_app.py
 - жмёшь кнопку коррекции
 - смотришь предпросмотр графика скорости «до/после»
 - скачиваешь готовый файл
+
+## macOS App (без терминала)
+
+Собрать `.app`:
+
+```bash
+./mac_app/build_mac_app.sh
+```
+
+После сборки появится приложение:
+
+`FIT Corrector.app`
+
+Его можно запускать двойным кликом в Finder. Приложение поднимает Streamlit в фоне и открывает браузер автоматически.
+При первом запуске приложение создаст локальное окружение `.venv_app` и установит зависимости.
 
 ## Deploy (Streamlit Community Cloud)
 
